@@ -421,7 +421,7 @@ rk3588_secure_otp_read:
 	sub	w0, w20, #416
 	mov	x19, 0
 	cmp	w0, 95
-	bls	.L23
+	bl	.L23
 	.loc 1 106 0 is_stmt 1
 	mov	w21, -1
 	.loc 1 105 0
@@ -543,7 +543,6 @@ rk3588_secure_otp_write:
 	.loc 1 172 0 discriminator 2
 	sub	w0, w25, #416
 	cmp	w0, 95
-	bhi	.L33
 .L44:
 	mov	x19, 0
 .LBB31:
