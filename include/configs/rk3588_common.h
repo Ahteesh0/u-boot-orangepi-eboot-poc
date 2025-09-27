@@ -38,6 +38,7 @@
 #define OTP_SECURE_BOOT_ENABLE_SIZE	1
 #define OTP_RSA_HASH_ADDR		0x9c0
 #define OTP_RSA_HASH_SIZE		32
+#define OTP_ENC_KEY_ADDR		0x20*4
 
 /* MMC/SD IP block */
 #define CONFIG_BOUNCE_BUFFER

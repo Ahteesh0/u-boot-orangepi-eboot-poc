@@ -614,104 +614,140 @@ int rsa_burn_key_hash(struct image_sign_info *info)
 	if (ret)
 		return ret;
 
-	if (secure_boot_enable)
-		return 0;
+	if (secure_boot_enable){
+		printf("secure boot on\n");
+	}else{
 
-	sig_node = fdt_subnode_offset(blob, 0, FIT_SIG_NODENAME);
-	if (sig_node < 0) {
-		debug("%s: No signature node found\n", __func__);
-		return -ENOENT;
-	}
+		sig_node = fdt_subnode_offset(blob, 0, FIT_SIG_NODENAME);
+		if (sig_node < 0) {
+			debug("%s: No signature node found\n", __func__);
+			return -ENOENT;
+		}
 
-	snprintf(name, sizeof(name), "key-%s", info->keyname);
-	node = fdt_subnode_offset(blob, sig_node, name);
+		snprintf(name, sizeof(name), "key-%s", info->keyname);
+		node = fdt_subnode_offset(blob, sig_node, name);
 
-	if (rsa_get_key_prop(&prop, info, node))
-		return -1;
+		if (rsa_get_key_prop(&prop, info, node))
+			return -1;
 
-	if (!(prop.burn_key))
-		return -EPERM;
+		if (!(prop.burn_key))
+			return -EPERM;
 
-	if (!prop.hash || !prop.modulus || !prop.public_exponent_BN)
-		return -ENOENT;
+		if (!prop.hash || !prop.modulus || !prop.public_exponent_BN)
+			return -ENOENT;
 #ifdef CONFIG_ROCKCHIP_CRYPTO_V1
-	if (!prop.factor_c)
-		return -ENOENT;
+		if (!prop.factor_c)
+			return -ENOENT;
 #else
-	if (!prop.factor_np)
-		return -ENOENT;
+		if (!prop.factor_np)
+			return -ENOENT;
 #endif
-	key_len = info->crypto->key_len;
-	if (info->crypto->key_len != RSA2048_BYTES)
-		return -EINVAL;
+		key_len = info->crypto->key_len;
+		if (info->crypto->key_len != RSA2048_BYTES)
+			return -EINVAL;
 
-	rsa_key = calloc(key_len * 3, sizeof(char));
-	if (!rsa_key)
-		return -ENOMEM;
+		rsa_key = calloc(key_len * 3, sizeof(char));
+		if (!rsa_key)
+			return -ENOMEM;
 
-	n = rsa_key;
-	e = rsa_key + CONFIG_RSA_N_SIZE;
-	c = rsa_key + CONFIG_RSA_N_SIZE + CONFIG_RSA_E_SIZE;
-	rsa_convert_big_endian(n, (uint32_t *)prop.modulus,
-			       key_len, CONFIG_RSA_N_SIZE);
-	rsa_convert_big_endian(e, (uint32_t *)prop.public_exponent_BN,
-			       key_len, CONFIG_RSA_E_SIZE);
+		n = rsa_key;
+		e = rsa_key + CONFIG_RSA_N_SIZE;
+		c = rsa_key + CONFIG_RSA_N_SIZE + CONFIG_RSA_E_SIZE;
+		rsa_convert_big_endian(n, (uint32_t *)prop.modulus,
+				       key_len, CONFIG_RSA_N_SIZE);
+		rsa_convert_big_endian(e, (uint32_t *)prop.public_exponent_BN,
+				       key_len, CONFIG_RSA_E_SIZE);
 #ifdef CONFIG_ROCKCHIP_CRYPTO_V1
-	rsa_convert_big_endian(c, (uint32_t *)prop.factor_c,
-			       key_len, CONFIG_RSA_C_SIZE);
+		rsa_convert_big_endian(c, (uint32_t *)prop.factor_c,
+				       key_len, CONFIG_RSA_C_SIZE);
 #else
-	rsa_convert_big_endian(c, (uint32_t *)prop.factor_np,
-			       key_len, CONFIG_RSA_C_SIZE);
+		rsa_convert_big_endian(c, (uint32_t *)prop.factor_np,
+				       key_len, CONFIG_RSA_C_SIZE);
 #endif
 
-	ret = calculate_hash(rsa_key, CONFIG_RSA_N_SIZE + CONFIG_RSA_E_SIZE + CONFIG_RSA_C_SIZE,
-			     info->checksum->name, digest, &digest_len);
-	if (ret)
-		goto error;
+		ret = calculate_hash(rsa_key, CONFIG_RSA_N_SIZE + CONFIG_RSA_E_SIZE + CONFIG_RSA_C_SIZE,
+				     info->checksum->name, digest, &digest_len);
+		if (ret)
+			goto error;
 
-	if (memcmp(digest, prop.hash, digest_len) != 0) {
-		printf("RSA: Compare public key hash fail.\n");
-		goto error;
-	}
-
-	/* burn key hash here */
-	ret = misc_otp_read(dev, OTP_RSA_HASH_ADDR, digest_read, OTP_RSA_HASH_SIZE);
-	if (ret)
-		goto error;
-
-	for (i = 0; i < OTP_RSA_HASH_SIZE; i++) {
-		if (digest_read[i]) {
-			printf("RSA: The secure region has been written.\n");
-			ret = -EIO;
+		if (memcmp(digest, prop.hash, digest_len) != 0) {
+			printf("RSA: Compare public key hash fail.\n");
 			goto error;
 		}
+
+		/* burn key hash here */
+		ret = misc_otp_read(dev, OTP_RSA_HASH_ADDR, digest_read, OTP_RSA_HASH_SIZE);
+		if (ret)
+			goto error;
+
+		for (i = 0; i < OTP_RSA_HASH_SIZE; i++) {
+			if (digest_read[i]) {
+				printf("RSA: The secure region has been written.\n");
+				ret = -EIO;
+				goto error;
+			}
+		}
+
+		ret = misc_otp_write(dev, OTP_RSA_HASH_ADDR, digest, OTP_RSA_HASH_SIZE);
+		if (ret)
+			goto error;
+
+		memset(digest_read, 0, FIT_MAX_HASH_LEN);
+		ret = misc_otp_read(dev, OTP_RSA_HASH_ADDR, digest_read, OTP_RSA_HASH_SIZE);
+		if (ret)
+			goto error;
+
+		if (memcmp(digest, digest_read, digest_len) != 0) {
+			printf("RSA: Write public key hash fail.\n");
+			goto error;
+		}
+
+		secure_boot_enable = 0xff;
+		ret = misc_otp_write(dev, OTP_SECURE_BOOT_ENABLE_ADDR,
+				     &secure_boot_enable, OTP_SECURE_BOOT_ENABLE_SIZE);
+		if (ret){
+		error:
+			free(rsa_key);
+
+			return ret;
+		}
+		printf("RSA: Write key hash successfully\n");
+		free(rsa_key);
 	}
-
-	ret = misc_otp_write(dev, OTP_RSA_HASH_ADDR, digest, OTP_RSA_HASH_SIZE);
-	if (ret)
-		goto error;
-
-	memset(digest_read, 0, FIT_MAX_HASH_LEN);
-	ret = misc_otp_read(dev, OTP_RSA_HASH_ADDR, digest_read, OTP_RSA_HASH_SIZE);
-	if (ret)
-		goto error;
-
-	if (memcmp(digest, digest_read, digest_len) != 0) {
-		printf("RSA: Write public key hash fail.\n");
-		goto error;
+	int length;
+	uint8_t* key_enc;
+	uint8_t key_enc_otp[16];
+	const void *key_blob = gd_fdt_blob();
+	int key_node=fdt_subnode_offset(key_blob, 0, "encryption");
+	key_enc  =(uint8_t *)  fdt_getprop(key_blob, key_node, "key", &length);
+	if (length!=16){
+		printf("no valid encryption key prop\n");
+		return 0;
 	}
-
-	secure_boot_enable = 0xff;
-	ret = misc_otp_write(dev, OTP_SECURE_BOOT_ENABLE_ADDR,
-			     &secure_boot_enable, OTP_SECURE_BOOT_ENABLE_SIZE);
+	// OTP_ENC_KEY_ADDR 
+	// RK3588S	0x20*4
+	// RK3566	0xA*4
+	// RK3576	0x38*4
+	ret = misc_otp_read(dev, OTP_ENC_KEY_ADDR , key_enc_otp , 16);
 	if (ret)
-		goto error;
-
-	printf("RSA: Write key hash successfully\n");
-
-error:
-	free(rsa_key);
-
+		return ret;
+	if (memcmp(key_enc,key_enc_otp,16)==0){
+		printf("enc key already written\n");
+	}else{
+		for (int i=0;i<16;++i){
+			if (key_enc_otp[i]!=0){
+				printf("bad data in enc key otp\n");
+				return -1;
+			}
+		}
+		ret = misc_otp_write(dev, OTP_ENC_KEY_ADDR , key_enc , 16);
+		ret = misc_otp_read(dev, OTP_ENC_KEY_ADDR , key_enc_otp , 16);
+		if (memcmp(key_enc,key_enc_otp,16)!=0){
+			printf("writen enc key mismatch\n");
+			return -1;
+		}
+		printf("write enc key OK\n");
+	}
 	return ret;
 }
 #endif
