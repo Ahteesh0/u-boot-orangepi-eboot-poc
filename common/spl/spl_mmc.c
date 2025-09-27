@@ -53,6 +53,48 @@ static ulong h_spl_load_read(struct spl_load_info *load, ulong sector,
 	return blk_dread(load->dev, sector, count, buf);
 }
 
+#include <misc.h>
+#include <crypto.h>
+#define ENC_KEY_SIZE 16
+int decrypt_uboot_head(void* src, void* dst, size_t size);
+int decrypt_uboot_head(void* src, void* dst, size_t size){
+	uint8_t* key;
+	const void *blob = gd_fdt_blob();
+	int key_node=fdt_subnode_offset(blob, 0, "encryption");
+	key  =(uint8_t *)  fdt_getprop(blob, key_node, "key", NULL);
+
+	uint8_t nonce[ENC_KEY_SIZE] = {0};
+	uint8_t tag[ENC_KEY_SIZE]={0};
+	uint8_t dig[ENC_KEY_SIZE]={0};
+	uint8_t aad[ENC_KEY_SIZE]={0};
+	struct udevice *dev;
+	cipher_context ctx;
+
+	memcpy(nonce,src,ENC_KEY_SIZE);
+	memcpy(tag,src+ENC_KEY_SIZE,ENC_KEY_SIZE);
+
+	dev = crypto_get_device(CRYPTO_AES);
+	ctx.algo    = CRYPTO_AES;
+	ctx.mode    = RK_MODE_GCM;
+	ctx.key     = key;
+	ctx.key_len = ENC_KEY_SIZE;
+	ctx.iv      = &nonce[0];
+	ctx.iv_len  = ENC_KEY_SIZE;
+
+	int ret = crypto_ae(dev,&ctx,src+2*ENC_KEY_SIZE,size, aad, ENC_KEY_SIZE, dst, dig);
+	uint64_t * a = (uint64_t *) tag; 
+	uint64_t * b = (uint64_t *) dig; 
+	if (ret || ((a[0]^b[0])|(a[1]^b[1]))){
+		memset(src,0,size+2*ENC_KEY_SIZE);
+		memset(dst,0,size);
+		return -2;
+	}
+	if (src==dst)
+		memset(src+size,0,2*ENC_KEY_SIZE);
+	return 0;
+}
+
+
 static __maybe_unused
 int mmc_load_image_raw_sector(struct spl_image_info *spl_image,
 			      struct mmc *mmc, unsigned long sector)
@@ -71,7 +113,8 @@ int mmc_load_image_raw_sector(struct spl_image_info *spl_image,
 		ret = -EIO;
 		goto end;
 	}
-
+	if (decrypt_uboot_head(header,header,sizeof(struct image_header)))
+		return -EIO;
 #ifdef CONFIG_SPL_FIT_IMAGE_MULTIPLE
 	if ((IS_ENABLED(CONFIG_SPL_LOAD_FIT) &&
 	     image_get_magic(header) == FDT_MAGIC) ||

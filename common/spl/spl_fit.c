@@ -20,6 +20,48 @@
 #define CONFIG_SYS_BOOTM_LEN	(64 << 20)
 #endif
 
+#include <misc.h>
+#include <crypto.h>
+#define ENC_KEY_SIZE 16
+
+int decrypt_uboot(void* src, void* dst, size_t size, void* aad, void* tag_out);
+int decrypt_uboot(void* src, void* dst, size_t size, void* aad, void* tag_out){
+	uint8_t* key;
+	const void *blob = gd_fdt_blob();
+	int key_node=fdt_subnode_offset(blob, 0, "encryption");
+	key  =(uint8_t *)  fdt_getprop(blob, key_node, "key", NULL);
+
+	uint8_t nonce[ENC_KEY_SIZE] = {0};
+	uint8_t tag[ENC_KEY_SIZE]={0};
+	uint8_t dig[ENC_KEY_SIZE]={0};
+	struct udevice *dev;
+	cipher_context ctx;
+	memcpy(nonce,src,ENC_KEY_SIZE);
+	memcpy(tag,src+ENC_KEY_SIZE,ENC_KEY_SIZE);
+	dev = crypto_get_device(CRYPTO_AES);
+	ctx.algo    = CRYPTO_AES;
+	ctx.mode    = RK_MODE_GCM;
+	ctx.key     = key;
+	ctx.key_len = ENC_KEY_SIZE;
+	ctx.iv      = &nonce[0];
+	ctx.iv_len  = ENC_KEY_SIZE;
+
+	int ret = crypto_ae(dev,&ctx,src+2*ENC_KEY_SIZE,size, aad, ENC_KEY_SIZE, dst, dig);
+	uint64_t * a = (uint64_t *) tag;
+	uint64_t * b = (uint64_t *) dig;
+	if (ret || ((a[0]^b[0])|(a[1]^b[1]))){
+		memset(src,0,size+2*ENC_KEY_SIZE);
+		memset(dst,0,size);
+		return -2;
+	}
+	memset(dst+size,0,2*ENC_KEY_SIZE);
+	if (tag_out)
+		memcpy(tag_out,dig,ENC_KEY_SIZE);
+	return 0;
+}
+
+
+
 /**
  * spl_fit_get_image_name(): By using the matching configuration subnode,
  * retrieve the name of an image, specified by a property name and an index
@@ -160,12 +202,13 @@ static int get_aligned_image_size(struct spl_load_info *info, int data_size,
  *		If the FIT node does not contain a "load" (address) property,
  *		the image gets loaded to the address pointed to by the
  *		load_addr member in this struct.
- *
+ /
  * Return:	0 on success or a negative error number.
  */
+
 static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 			      void *fit, ulong base_offset, int node,
-			      struct spl_image_info *image_info)
+			      struct spl_image_info *image_info, void *aad)
 {
 	int offset;
 	size_t length;
@@ -179,7 +222,6 @@ static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 	uint8_t image_comp = -1, type = -1;
 	const void *data;
 	bool external_data = false;
-
 	if (IS_ENABLED(CONFIG_SPL_OS_BOOT) && IS_ENABLED(CONFIG_SPL_GZIP)) {
 		if (fit_image_get_comp(fit, node, &image_comp))
 			puts("Cannot get image compression format.\n");
@@ -216,7 +258,6 @@ static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 		/* External data */
 		if (fit_image_get_data_size(fit, node, &len))
 			return -ENOENT;
-
 		load_ptr = (comp_addr + align_len) & ~align_len;
 #if  defined(CONFIG_ARCH_ROCKCHIP)
 		if ((load_ptr < CONFIG_SYS_SDRAM_BASE) ||
@@ -232,10 +273,11 @@ static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 			       sector + get_aligned_image_offset(info, offset),
 			       nr_sectors, (void *)load_ptr) != nr_sectors)
 			return -EIO;
-
 		debug("External data: dst=%lx, offset=%x, size=%lx\n",
 		      load_ptr, offset, (unsigned long)length);
 		src = (void *)load_ptr + overhead;
+		if (decrypt_uboot(src, src, length-2*ENC_KEY_SIZE,aad,NULL))
+                    return -1; 
 	} else {
 		/* Embedded data */
 		if (fit_image_get_data(fit, node, &data, &length)) {
@@ -283,6 +325,7 @@ static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 		}
 		length = size;
 	} else {
+		length-=2*ENC_KEY_SIZE;
 		memcpy((void *)load_addr, src, length);
 	}
 
@@ -297,7 +340,8 @@ static int spl_load_fit_image(struct spl_load_info *info, ulong sector,
 
 static int spl_fit_append_fdt(struct spl_image_info *spl_image,
 			      struct spl_load_info *info, ulong sector,
-			      void *fit, int images, ulong base_offset)
+			      void *fit, int images, ulong base_offset,
+			      void * aad)
 {
 	struct spl_image_info image_info;
 	int node, ret;
@@ -315,7 +359,7 @@ static int spl_fit_append_fdt(struct spl_image_info *spl_image,
 	 */
 	image_info.load_addr = spl_image->load_addr + spl_image->size;
 	ret = spl_load_fit_image(info, sector, fit, base_offset, node,
-				 &image_info);
+				 &image_info,aad);
 
 	if (ret < 0)
 		return ret;
@@ -342,7 +386,7 @@ static int spl_fit_append_fdt(struct spl_image_info *spl_image,
 	image_info.load_addr =
 		(ulong)spl_image->fdt_addr + fdt_totalsize(spl_image->fdt_addr);
 	ret = spl_load_fit_image(info, sector, fit, base_offset, node,
-				 &image_info);
+				 &image_info,aad);
 
 	return ret;
 }
@@ -384,9 +428,10 @@ __weak int spl_fit_standalone_release(char *id, uintptr_t entry_point)
 	return 0;
 }
 
+
 static void *spl_fit_load_blob(struct spl_load_info *info,
 			       ulong sector, void *fit_header,
-			       int *base_offset)
+			       int *base_offset, void* aad)
 {
 	int align_len = ARCH_DMA_MINALIGN - 1;
 	ulong count;
@@ -399,7 +444,7 @@ static void *spl_fit_load_blob(struct spl_load_info *info,
 	 * start. This is the base for the data-offset properties in each
 	 * image.
 	 */
-	size = fdt_totalsize(fit_header);
+	size = 0x1000; //FIXME fdt_totalsize(fit_header)+4*ENC_KEY_SIZE;
 	size = FIT_ALIGN(size);
 	*base_offset = FIT_ALIGN(size);
 
@@ -424,6 +469,13 @@ static void *spl_fit_load_blob(struct spl_load_info *info,
 			align_len) & ~align_len);
 	sectors = get_aligned_image_size(info, size, 0);
 	count = info->read(info, sector, sectors, fit);
+	if (decrypt_uboot(fit,fit,sizeof(struct image_header),aad,aad))
+            return NULL;
+        if (decrypt_uboot(fit+sizeof(struct image_header)+2*ENC_KEY_SIZE,
+	 		fit+sizeof(struct image_header),
+			 0x1000-4*ENC_KEY_SIZE-sizeof(struct image_header)
+			 ,aad,aad ))
+            return NULL;
 #ifdef CONFIG_MTD_BLK
 	mtd_blk_map_fit(info->dev, sector, fit);
 #endif
@@ -490,8 +542,8 @@ static int spl_load_kernel_fit(struct spl_image_info *spl_image,
 		printf("%s: Not fit magic\n", __func__);
 		return -EINVAL;
 	}
-
-	fit = spl_fit_load_blob(info, sector, fit_header, &base_offset);
+	uint8_t aad[ENC_KEY_SIZE]={0};
+	fit = spl_fit_load_blob(info, sector, fit_header, &base_offset, aad);
 	if (!fit) {
 		debug("%s: Cannot load blob\n", __func__);
 		return -ENODEV;
@@ -530,7 +582,7 @@ static int spl_load_kernel_fit(struct spl_image_info *spl_image,
 		}
 
 		ret = spl_load_fit_image(info, sector, fit, base_offset,
-					 node, &image_info);
+					 node, &image_info, aad);
 		if (ret)
 			return ret;
 
@@ -586,7 +638,8 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 	int node = -1;
 	void *fit;
 
-	fit = spl_fit_load_blob(info, sector, fit_header, &base_offset);
+	uint8_t aad[ENC_KEY_SIZE]={0};
+	fit = spl_fit_load_blob(info, sector, fit_header, &base_offset,aad);
 	if (!fit) {
 		debug("%s: Cannot load blob\n", __func__);
 		return -1;
@@ -655,7 +708,7 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 			break;
 
 		ret = spl_load_fit_image(info, sector, fit, base_offset,
-					 node, &image_info);
+					 node, &image_info,aad);
 		if (ret)
 			return ret;
 
@@ -705,7 +758,8 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 
 	/* Load the image and set up the spl_image structure */
 	ret = spl_load_fit_image(info, sector, fit, base_offset, node,
-				 spl_image);
+				 spl_image,aad);
+
 	if (ret)
 		return ret;
 
@@ -726,7 +780,7 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 	 */
 	if (spl_image->os == IH_OS_U_BOOT)
 		spl_fit_append_fdt(spl_image, info, sector, fit,
-				   images, base_offset);
+				   images, base_offset,aad);
 
 	/* Now check if there are more images for us to load */
 	for (; ; index++) {
@@ -745,7 +799,7 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 		    continue;
 
 		ret = spl_load_fit_image(info, sector, fit, base_offset, node,
-					 &image_info);
+					 &image_info,aad);
 		if (ret < 0)
 			return ret;
 
@@ -756,7 +810,7 @@ static int spl_internal_load_simple_fit(struct spl_image_info *spl_image,
 			spl_image->entry_point_os = image_info.load_addr;
 #endif
 			spl_fit_append_fdt(&image_info, info, sector,
-					   fit, images, base_offset);
+					   fit, images, base_offset,aad);
 			spl_image->fdt_addr = image_info.fdt_addr;
 		}
 
@@ -804,7 +858,6 @@ int spl_load_simple_fit(struct spl_image_info *spl_image,
 				continue;
 			}
 		}
-
 		if (image_get_magic(fit) != FDT_MAGIC) {
 			printf("Not fit magic\n");
 			continue;

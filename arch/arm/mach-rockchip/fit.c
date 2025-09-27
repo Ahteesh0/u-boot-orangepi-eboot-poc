@@ -136,6 +136,46 @@ static int fit_image_get_param(const void *fit, const char *prop_name,
 	return fdt_image_get_load(fit, prop_name, load);
 }
 
+#include <crypto.h>
+#define ENC_KEY_SIZE 16
+int decrypt(void* src, void* dst, size_t size, void* aad, void* tag_out);
+int decrypt(void* src, void* dst, size_t size, void* aad, void* tag_out){
+	uint8_t* key; 
+	const void *blob = gd_fdt_blob();
+	int key_node=fdt_subnode_offset(blob, 0, "encryption");
+	key  =(uint8_t *)  fdt_getprop(blob, key_node, "key", NULL);
+	
+	uint8_t nonce[ENC_KEY_SIZE] = {0};
+	uint8_t tag[ENC_KEY_SIZE]={0};
+	uint8_t dig[ENC_KEY_SIZE]={0};
+	struct udevice *dev;
+	cipher_context ctx;
+
+	memcpy(nonce,src,ENC_KEY_SIZE);
+	memcpy(tag,src+ENC_KEY_SIZE,ENC_KEY_SIZE);
+	
+	dev = crypto_get_device(CRYPTO_AES);
+	ctx.algo    = CRYPTO_AES;
+	ctx.mode    = RK_MODE_GCM;
+	ctx.key     = key;
+	ctx.key_len = ENC_KEY_SIZE;
+	ctx.iv      = &nonce[0];
+	ctx.iv_len  = ENC_KEY_SIZE;
+
+	int ret = crypto_ae(dev,&ctx,src+2*ENC_KEY_SIZE,size, aad, ENC_KEY_SIZE, dst, dig);
+	uint64_t * a = (uint64_t *) tag; 
+	uint64_t * b = (uint64_t *) dig; 
+	if (ret || ((a[0]^b[0])|(a[1]^b[1]))){
+		memset(src,0,size+2*ENC_KEY_SIZE);
+		memset(dst,0,size);
+		return -2;
+	}
+	memset(dst+size,0,2*ENC_KEY_SIZE);
+	if (tag_out)
+		memcpy(tag_out,dig,ENC_KEY_SIZE); 
+	return 0;
+}
+
 static void *fit_get_blob(struct blk_desc *dev_desc,
 			  disk_partition_t *out_part,
 			  bool verify)
@@ -145,6 +185,7 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 	char *part_name;
 	void *fit, *fdt;
 	int blk_num;
+	uint8_t aad[ENC_KEY_SIZE]={0};
 
 	if (rockchip_get_boot_mode() == BOOT_MODE_RECOVERY)
 		part_name = PART_RECOVERY;
@@ -157,7 +198,7 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 	}
 
 	*out_part = part;
-	blk_num = DIV_ROUND_UP(sizeof(struct fdt_header), dev_desc->blksz);
+	blk_num = DIV_ROUND_UP(sizeof(struct fdt_header)+2*ENC_KEY_SIZE, dev_desc->blksz);
 	fdt = memalign(ARCH_DMA_MINALIGN, blk_num * dev_desc->blksz);
 	if (!fdt)
 		return NULL;
@@ -166,7 +207,8 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 		debug("Failed to read fdt header\n");
 		goto fail;
 	}
-
+	
+	decrypt(fdt,fdt,sizeof(struct fdt_header),aad,NULL);
 	if (fdt_check_header(fdt)) {
 		debug("No fdt header\n");
 		goto fail;
@@ -177,7 +219,7 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 		goto fail;
 	}
 
-	blk_num = DIV_ROUND_UP(fdt_totalsize(fdt), dev_desc->blksz);
+	blk_num = DIV_ROUND_UP(fdt_totalsize(fdt)+4*ENC_KEY_SIZE, dev_desc->blksz);
 	fit = memalign(ARCH_DMA_MINALIGN, blk_num * dev_desc->blksz);
 	if (!fit) {
 		debug("No memory\n");
@@ -189,7 +231,13 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 		debug("Failed to read fit blob\n");
 		goto fail;
 	}
-
+	if (decrypt(fit,fit,sizeof(struct fdt_header),aad,aad))
+		goto fail;
+	if (decrypt(fit+sizeof(struct fdt_header)+2*ENC_KEY_SIZE,
+			fit+sizeof(struct fdt_header),
+			fdt_totalsize(fdt)-sizeof(struct fdt_header),
+			aad,NULL))
+		goto fail;
 #ifdef CONFIG_FIT_SIGNATURE
 	if (!verify)
 		return fit;
@@ -301,6 +349,7 @@ static int fit_image_load_one(const void *fit, struct blk_desc *dev_desc,
 	int noffset, ret;
 	char *msg = "";
 
+
 	ret = fdt_image_get_offset_size(fit, prop_name, &offset, &size);
 	if (ret)
 		return ret;
@@ -376,14 +425,13 @@ void *fit_image_load_bootables(ulong *size)
 		FIT_I("No fit blob\n");
 		return NULL;
 	}
-
 	*size = fit_image_get_bootables_size(fit);
 	if (*size == 0) {
 		FIT_I("No bootable image\n");
 		return NULL;
 	}
 
-	blk_num = DIV_ROUND_UP(*size, dev_desc->blksz);
+	blk_num = DIV_ROUND_UP(*size + 6*ENC_KEY_SIZE, dev_desc->blksz);
 	fit = sysmem_alloc(MEM_FIT, blk_num * dev_desc->blksz);
 	if (!fit)
 		return NULL;
@@ -392,7 +440,17 @@ void *fit_image_load_bootables(ulong *size)
 		FIT_I("Failed to load bootable images\n");
 		return NULL;
 	}
-
+	size_t head_size=sizeof(struct fdt_header); //0x28
+	uint8_t aad[ENC_KEY_SIZE]={0};
+	if (decrypt(fit,fit,head_size,aad,aad))
+		return NULL;
+	size_t head2_size=fdt_totalsize(fit);	//0x800
+	if (decrypt(fit+head_size+2*ENC_KEY_SIZE,fit+head_size,
+			head2_size-head_size,aad,aad))
+		return NULL;
+	if (decrypt(fit+head2_size+4*ENC_KEY_SIZE,fit+head2_size,
+			*size-head2_size,aad,aad))
+		return NULL;
 	return fit;
 }
 
