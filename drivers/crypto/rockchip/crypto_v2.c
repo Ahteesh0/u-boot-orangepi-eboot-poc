@@ -1248,7 +1248,7 @@ int rk_crypto_ae(struct udevice *dev, u32 algo, u32 mode,
 #endif
 
 	ret = hw_cipher_init(g_key_chn, key, NULL, key_len, nonce, nonce_len,
-			     algo, mode, true);
+			     algo, mode, false);
 	if (ret)
 		return ret;
 
